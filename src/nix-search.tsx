@@ -114,17 +114,65 @@ function indexPattern(channel: string) {
 }
 
 function buildQuery(query: string) {
+	const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+	const positiveWords = words.filter((word) => !word.startsWith("-"));
+	const negativeWords = words
+		.filter((word) => word.startsWith("-") && word.length > 1)
+		.map((word) => word.slice(1));
+	const searchText = positiveWords.join(" ");
+	const variants = (word: string) => [
+		...new Set([word, word.replace(/_/g, "-"), word.replace(/-/g, "_")]),
+	];
+	const wildcardQueries = positiveWords.flatMap((word) =>
+		variants(word).map((variant) => ({
+			wildcard: {
+				package_attr_name: {
+					value: `*${variant}*`,
+					case_insensitive: true,
+				},
+			},
+		})),
+	);
+	const joinedVariants = [
+		...new Set([
+			positiveWords.join(""),
+			positiveWords.join("-"),
+			positiveWords.join("_"),
+		]),
+	];
+	const bestMatchFields = [
+		"package_attr_name^9",
+		"package_attr_name.*^5.4",
+		"package_programs^9",
+		"package_programs.*^5.4",
+		"package_mainProgram^9",
+		"package_mainProgram.*^5.4",
+		"package_pname^6",
+		"package_pname.*^3.6",
+		"package_description^1.3",
+		"package_description.*^0.78",
+		"package_longDescription^1",
+		"package_longDescription.*^0.6",
+		"flake_name^0.5",
+		"flake_name.*^0.3",
+	];
 	return {
 		from: 0,
 		size: RESULT_LIMIT,
-		sort: [
-			{ _score: "desc" },
-			{ package_attr_name: "desc" },
-			{ package_pversion: "desc" },
-		],
+		sort: [{ _score: "desc" }],
 		query: {
 			bool: {
 				filter: [{ term: { type: "package" } }],
+				must_not: negativeWords.flatMap((word) =>
+					variants(word).map((variant) => ({
+						wildcard: {
+							package_attr_name: {
+								value: `*${variant}*`,
+								case_insensitive: true,
+							},
+						},
+					})),
+				),
 				must: [
 					{
 						dis_max: {
@@ -133,36 +181,106 @@ function buildQuery(query: string) {
 								{
 									multi_match: {
 										type: "cross_fields",
-										query,
+										query: searchText,
 										analyzer: "whitespace",
 										auto_generate_synonyms_phrase_query: false,
 										operator: "and",
-										fields: [
-											"package_attr_name^9",
-											"package_attr_name.*^5.4",
-											"package_programs^9",
-											"package_programs.*^5.4",
-											"package_pname^6",
-											"package_pname.*^3.6",
-											"package_description^1.3",
-											"package_description.*^0.78",
-											"package_longDescription^1",
-											"package_longDescription.*^0.6",
-										],
+										fields: bestMatchFields,
 									},
 								},
 								{
-									wildcard: {
-										package_attr_name: {
-											value: `*${query.replace(/[\\*?]/g, "\\$&")}*`,
-											case_insensitive: true,
-										},
+									multi_match: {
+										type: "best_fields",
+										query: searchText,
+										fuzziness: "1",
+										prefix_length: 1,
+										operator: "and",
+										fields: [
+											"package_attr_name^0.45",
+											"package_programs^0.45",
+											"package_mainProgram^0.45",
+											"package_pname^0.3",
+										],
 									},
 								},
+								...wildcardQueries,
 							],
 						},
 					},
 				],
+				should: [
+					...joinedVariants.flatMap((value) => [
+						{ term: { package_attr_name: { value, boost: 100 } } },
+						...["-", "_"].map((separator) => ({
+							prefix: {
+								package_attr_name: {
+									value: `${value}${separator}`,
+									boost: 100,
+									case_insensitive: true,
+								},
+							},
+						})),
+						{
+							prefix: {
+								package_attr_name: {
+									value,
+									boost: 20,
+									case_insensitive: true,
+								},
+							},
+						},
+					]),
+					...(positiveWords.length > 1
+						? [
+								{
+									constant_score: {
+										filter: {
+											multi_match: {
+												type: "phrase",
+												query: searchText,
+												fields: [
+													"package_attr_name",
+													"package_pname",
+													"package_programs",
+													"package_mainProgram",
+												],
+											},
+										},
+										boost: 80,
+									},
+								},
+							]
+						: []),
+					{
+						rank_feature: {
+							field: "package_repology_repos",
+							boost: 5,
+							saturation: { pivot: 20 },
+						},
+					},
+					{
+						rank_feature: {
+							field: "package_dep_count",
+							boost: 5,
+							saturation: { pivot: 1000 },
+						},
+					},
+				],
+			},
+		},
+		rescore: {
+			window_size: RESULT_LIMIT,
+			query: {
+				rescore_query: {
+					function_score: {
+						script_score: {
+							script: {
+								source: "1.0 / doc['package_attr_name'].value.length()",
+							},
+						},
+					},
+				},
+				rescore_query_weight: 20,
 			},
 		},
 		_source: [
@@ -557,6 +675,7 @@ export default function NixSearch() {
 	return (
 		<List
 			searchText={query}
+			filtering={false}
 			isLoading={isLoading}
 			searchBarPlaceholder={`Search nixpkgs (${
 				channel === "stable" ? (stableRelease ?? "stable") : channel
